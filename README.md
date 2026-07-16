@@ -26,9 +26,13 @@ On first launch, Windows SmartScreen may warn that the publisher is unknown (nor
 
 ## Usage
 
-- **Start / Stop button** — toggles jiggling on and off.
-- **Status label** — shows `ON` (green) or `OFF` (gray).
-- **Interval (sec)** — how often the mouse is nudged. Default is 30 seconds; range is 1–600.
+- **Power button** — the big glowing ring toggles jiggling on and off (it pulses while active).
+- **Status label** — shows `ACTIVE` (cyan) or `IDLE` (gray).
+- **Interval (s)** — how often the mouse is nudged. Default is 30 seconds; range is 1–600. Click **−**/**+** to step, or click-and-hold to scroll fast.
+- **Distance (px)** — how far each nudge moves. Default is 1 pixel.
+- **Hotkey** — click the pill, then press a key combo (needs Ctrl/Alt/Shift) to toggle jiggling globally. Default is Ctrl+Alt+J.
+- **Start with Windows** — flip the switch to launch the app hidden in the tray (already jiggling) at login.
+- **Title bar** — drag anywhere on it to move the window; **–** minimizes.
 - **Close button (X)** — hides the window to the system tray. Jiggling continues if it was on.
 - **System tray icon** — right-click for:
   - **Show** — bring the window back.
@@ -46,10 +50,9 @@ Because it uses synthetic input rather than just moving the cursor, it works wit
 
 Edit `MouseJiggler.cs`, then re-run `build.bat`. Common tweaks:
 
-- **Default interval** — change `Value = 30` on the `intervalBox` definition.
-- **Nudge distance** — change `inputs[0].mi.dx = d;` (currently `1` pixel).
+- **Default interval** — change `intervalBox.Value = 30` in the `MainForm` constructor.
 - **Always on top** — change `TopMost = true;` to `false`.
-- **Start minimized to tray** — add `WindowState = FormWindowState.Minimized; ShowInTaskbar = false;` in the `MainForm` constructor.
+- **Colors** — everything lives in the `Theme` class at the top of the file (background, accents, text). Change `Violet`/`Cyan` to restyle the whole app.
 
 ## Troubleshooting
 
