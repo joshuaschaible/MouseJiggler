@@ -10,6 +10,18 @@ namespace MouseJigglerApp
 {
     static class Program
     {
+        [DllImport("user32.dll")]
+        private static extern int RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        private static readonly IntPtr HWND_BROADCAST = (IntPtr)0xFFFF;
+
+        // Same string resolves to the same message id in every process, so a second
+        // instance can tell the first one to surface itself.
+        internal static readonly int WM_SHOW_INSTANCE = RegisterWindowMessage("MouseJigglerShowWindow");
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -24,7 +36,20 @@ namespace MouseJigglerApp
                     silent = true;
             }
 
-            Application.Run(new MainForm(silent));
+            bool createdNew;
+            using (var single = new System.Threading.Mutex(true, @"Local\MouseJiggler.SingleInstance", out createdNew))
+            {
+                if (!createdNew)
+                {
+                    // Already running: hand the window over to the existing copy and bail.
+                    // Launching a second instance would otherwise fail to grab the hotkey.
+                    if (!silent) PostMessage(HWND_BROADCAST, WM_SHOW_INSTANCE, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+
+                Application.Run(new MainForm(silent));
+                GC.KeepAlive(single);
+            }
         }
     }
 
@@ -437,7 +462,7 @@ namespace MouseJigglerApp
             {
                 float target = isChecked ? 1f : 0f;
                 float d = target - pos;
-                if (Math.Abs(d) < 0.04f) { pos = target; anim.Stop(); }
+                if (Math.Abs(d) <= 0.16f) { pos = target; anim.Stop(); }
                 else pos += Math.Sign(d) * 0.16f;
                 Invalidate();
             };
@@ -512,6 +537,32 @@ namespace MouseJigglerApp
         [DllImport("gdi32.dll")]
         private static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int w, int h);
 
+        // ---- Idle detection ----
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetTickCount();
+
+        // ---- Sleep suppression ----
+        [DllImport("kernel32.dll")]
+        private static extern uint SetThreadExecutionState(uint esFlags);
+
+        private const uint ES_CONTINUOUS       = 0x80000000;
+        private const uint ES_SYSTEM_REQUIRED  = 0x00000001;
+        private const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+        // ---- Tray icon generation ----
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
         private const int WM_HOTKEY = 0x0312;
         private const int WM_NCHITTEST = 0x0084;
         private const int HTCLIENT = 1;
@@ -542,7 +593,12 @@ namespace MouseJigglerApp
         private readonly Stepper distanceBox;
         private readonly PillButton hotkeyButton;
         private readonly ToggleSwitch startupCheck;
+        private readonly ToggleSwitch topMostCheck;
+        private readonly ToggleSwitch idleCheck;
+        private readonly ToggleSwitch awakeCheck;
         private readonly NotifyIcon tray;
+        private readonly Icon trayIconOn;
+        private readonly Icon trayIconOff;
         private bool direction = false;
         private double pulsePhase = 0;
 
@@ -555,6 +611,19 @@ namespace MouseJigglerApp
         // ---- Startup behavior ----
         private bool startHidden = false;
         private bool autoStartJiggling = false;
+        private bool alwaysOnTop = true;
+        private bool pauseWhenActive = true;
+        private bool keepAwake = true;
+
+        // Tick of our own last injected nudge, so real input can be told apart from ours
+        private uint lastNudgeTick;
+
+        // How close to lastNudgeTick a last-input timestamp must be to count as our own
+        private const int NudgeGraceMs = 250;
+
+        // ---- Window placement ----
+        private Point savedLocation = Point.Empty;
+        private bool hasSavedLocation = false;
 
         protected override CreateParams CreateParams
         {
@@ -577,14 +646,22 @@ namespace MouseJigglerApp
             }
 
             Text = "Mouse Jiggler";
-            ClientSize = new Size(300, 448);
+            ClientSize = new Size(300, 568);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             MaximizeBox = false;
-            TopMost = true;
+            TopMost = alwaysOnTop;
             BackColor = Theme.Bg;
             DoubleBuffered = true;
             Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 18, 18));
+
+            // Restore the last window position, but only if it still lands on a
+            // connected monitor (a disconnected second screen would strand it).
+            if (hasSavedLocation && IsOnScreen(new Rectangle(savedLocation, Size)))
+            {
+                StartPosition = FormStartPosition.Manual;
+                Location = savedLocation;
+            }
 
             // App icon (taskbar / Alt+Tab)
             var appIcon = LoadAppIcon();
@@ -633,7 +710,7 @@ namespace MouseJigglerApp
                 Maximum = 600,
                 Location = new Point(controlX, rowY + (rowH - 30) / 2)
             };
-            intervalBox.Value = 30;
+            intervalBox.Value = pendingInterval;
             intervalBox.ValueChanged += delegate
             {
                 timer.Interval = intervalBox.Value * 1000;
@@ -649,7 +726,7 @@ namespace MouseJigglerApp
                 Maximum = 10000,
                 Location = new Point(controlX, rowY + (rowH - 30) / 2)
             };
-            distanceBox.Value = 1;
+            distanceBox.Value = pendingDistance;
             distanceBox.ValueChanged += delegate { SaveSettings(); };
             Controls.Add(distanceBox);
 
@@ -680,6 +757,50 @@ namespace MouseJigglerApp
                 }
             };
             Controls.Add(startupCheck);
+
+            rowY += rowH;
+            AddRowLabel("Always on top", labelX, rowY, rowH);
+            topMostCheck = new ToggleSwitch
+            {
+                Location = new Point(Width - 26 - 46, rowY + (rowH - 24) / 2)
+            };
+            topMostCheck.Checked = alwaysOnTop;
+            topMostCheck.CheckedChanged += delegate
+            {
+                alwaysOnTop = topMostCheck.Checked;
+                TopMost = alwaysOnTop;
+                SaveSettings();
+            };
+            Controls.Add(topMostCheck);
+
+            rowY += rowH;
+            AddRowLabel("Pause when active", labelX, rowY, rowH);
+            idleCheck = new ToggleSwitch
+            {
+                Location = new Point(Width - 26 - 46, rowY + (rowH - 24) / 2)
+            };
+            idleCheck.Checked = pauseWhenActive;
+            idleCheck.CheckedChanged += delegate
+            {
+                pauseWhenActive = idleCheck.Checked;
+                SaveSettings();
+            };
+            Controls.Add(idleCheck);
+
+            rowY += rowH;
+            AddRowLabel("Keep screen awake", labelX, rowY, rowH);
+            awakeCheck = new ToggleSwitch
+            {
+                Location = new Point(Width - 26 - 46, rowY + (rowH - 24) / 2)
+            };
+            awakeCheck.Checked = keepAwake;
+            awakeCheck.CheckedChanged += delegate
+            {
+                keepAwake = awakeCheck.Checked;
+                ApplyExecutionState();
+                SaveSettings();
+            };
+            Controls.Add(awakeCheck);
 
             var hint = new Label
             {
@@ -716,9 +837,12 @@ namespace MouseJigglerApp
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exitItem);
 
+            trayIconOn  = MakeTrayIcon(true);
+            trayIconOff = MakeTrayIcon(false);
+
             tray = new NotifyIcon
             {
-                Icon = appIcon ?? SystemIcons.Application,
+                Icon = trayIconOff ?? appIcon ?? SystemIcons.Application,
                 Text = "Mouse Jiggler (OFF)",
                 Visible = true,
                 ContextMenuStrip = trayMenu
@@ -868,6 +992,13 @@ namespace MouseJigglerApp
                 Toggle();
             }
 
+            // A second copy of the app was launched; surface this window instead.
+            if (m.Msg == Program.WM_SHOW_INSTANCE && Program.WM_SHOW_INSTANCE != 0)
+            {
+                ShowFromTray();
+                return;
+            }
+
             if (m.Msg == WM_NCHITTEST)
             {
                 base.WndProc(ref m);
@@ -926,10 +1057,23 @@ namespace MouseJigglerApp
                     object dv = key.GetValue("Distance");
                     object hm = key.GetValue("HotkeyMods");
                     object hk = key.GetValue("HotkeyKey");
-                    if (iv is int)        { /* applied after intervalBox created */ pendingInterval = (int)iv; }
+                    object ot = key.GetValue("AlwaysOnTop");
+                    object pa = key.GetValue("PauseWhenActive");
+                    object ka = key.GetValue("KeepAwake");
+                    object wx = key.GetValue("WindowX");
+                    object wy = key.GetValue("WindowY");
+                    if (iv is int)        { pendingInterval = (int)iv; }
                     if (dv is int)        { pendingDistance = (int)dv; }
                     if (hm is int)        { hotkeyMods = (uint)(int)hm; }
                     if (hk is int)        { hotkeyKey  = (Keys)(int)hk; }
+                    if (ot is int)        { alwaysOnTop = (int)ot != 0; }
+                    if (pa is int)        { pauseWhenActive = (int)pa != 0; }
+                    if (ka is int)        { keepAwake = (int)ka != 0; }
+                    if (wx is int && wy is int)
+                    {
+                        savedLocation = new Point((int)wx, (int)wy);
+                        hasSavedLocation = true;
+                    }
                 }
             }
             catch { /* ignore */ }
@@ -949,6 +1093,14 @@ namespace MouseJigglerApp
                     key.SetValue("Distance",  distanceBox.Value, RegistryValueKind.DWord);
                     key.SetValue("HotkeyMods", (int)hotkeyMods,  RegistryValueKind.DWord);
                     key.SetValue("HotkeyKey",  (int)hotkeyKey,   RegistryValueKind.DWord);
+                    key.SetValue("AlwaysOnTop", alwaysOnTop ? 1 : 0, RegistryValueKind.DWord);
+                    key.SetValue("PauseWhenActive", pauseWhenActive ? 1 : 0, RegistryValueKind.DWord);
+                    key.SetValue("KeepAwake", keepAwake ? 1 : 0, RegistryValueKind.DWord);
+                    if (hasSavedLocation)
+                    {
+                        key.SetValue("WindowX", savedLocation.X, RegistryValueKind.DWord);
+                        key.SetValue("WindowY", savedLocation.Y, RegistryValueKind.DWord);
+                    }
                 }
             }
             catch { /* ignore */ }
@@ -1000,6 +1152,58 @@ namespace MouseJigglerApp
             catch { return null; }
         }
 
+        // Tray icon drawn to match the power button: filled gradient when jiggling,
+        // hollow dim ring when idle — readable at a glance in the notification area.
+        private static Icon MakeTrayIcon(bool active)
+        {
+            try
+            {
+                using (var bmp = new Bitmap(32, 32))
+                {
+                    using (var g = Graphics.FromImage(bmp))
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        g.Clear(Color.Transparent);
+                        var r = new Rectangle(4, 4, 23, 23);
+                        if (active)
+                        {
+                            using (var lgb = new LinearGradientBrush(r, Theme.Violet, Theme.Cyan, 45f))
+                                g.FillEllipse(lgb, r);
+                        }
+                        else
+                        {
+                            using (var pen = new Pen(Theme.RingOffHover, 3.5f))
+                                g.DrawEllipse(pen, r);
+                        }
+                    }
+
+                    IntPtr h = bmp.GetHicon();
+                    try { return (Icon)Icon.FromHandle(h).Clone(); }
+                    finally { DestroyIcon(h); }
+                }
+            }
+            catch { return null; }
+        }
+
+        private static bool IsOnScreen(Rectangle bounds)
+        {
+            foreach (var s in Screen.AllScreens)
+                if (s.WorkingArea.IntersectsWith(bounds)) return true;
+            return false;
+        }
+
+        private void ApplyExecutionState()
+        {
+            try
+            {
+                if (keepAwake && timer.Enabled)
+                    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+                else
+                    SetThreadExecutionState(ES_CONTINUOUS);
+            }
+            catch { /* ignore */ }
+        }
+
         // ---- Jiggling ----
         private void Toggle()
         {
@@ -1012,6 +1216,7 @@ namespace MouseJigglerApp
                 status.Text = "IDLE";
                 status.ForeColor = Theme.TextDim;
                 tray.Text = "Mouse Jiggler (OFF)";
+                if (trayIconOff != null) tray.Icon = trayIconOff;
             }
             else
             {
@@ -1023,11 +1228,16 @@ namespace MouseJigglerApp
                 status.Text = "ACTIVE";
                 status.ForeColor = Theme.Cyan;
                 tray.Text = "Mouse Jiggler (ON)";
+                if (trayIconOn != null) tray.Icon = trayIconOn;
+                lastNudgeTick = GetTickCount();
             }
+            ApplyExecutionState();
         }
 
         private void Nudge()
         {
+            if (pauseWhenActive && UserActiveRecently()) return;
+
             int d = (direction ? 1 : -1) * distanceBox.Value;
             var inputs = new INPUT[1];
             inputs[0].type = INPUT_MOUSE;
@@ -1036,19 +1246,45 @@ namespace MouseJigglerApp
             inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE;
             SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
             direction = !direction;
+
+            // Recorded after the injection, so our own synthetic input — which also
+            // updates the system's last-input time — never counts as user activity.
+            lastNudgeTick = GetTickCount();
         }
 
-        protected override void OnLoad(EventArgs e)
+        private bool UserActiveRecently()
         {
-            base.OnLoad(e);
-            // Apply persisted numeric values now that the controls exist
-            try
+            var lii = new LASTINPUTINFO();
+            lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref lii)) return false;
+
+            // Our own injected nudge also bumps the system idle timer, so if the most
+            // recent input is ours there has been no real user activity.
+            // Unchecked subtraction keeps this correct across the 49.7-day tick wrap.
+            unchecked { if ((int)(lii.dwTime - lastNudgeTick) <= NudgeGraceMs) return false; }
+
+            // Real input happened. Stay paused until the user has been quiet for a full
+            // interval. Anchoring to lastNudgeTick instead would latch forever: that
+            // timestamp stops advancing while paused, so the gap never closes again.
+            uint idleMs = unchecked(GetTickCount() - lii.dwTime);
+            return idleMs < (uint)Math.Max(1000, intervalBox.Value * 1000);
+        }
+
+        // Track the position as it moves, but only hit the registry once the drag ends.
+        protected override void OnMove(EventArgs e)
+        {
+            base.OnMove(e);
+            if (WindowState == FormWindowState.Normal && Visible)
             {
-                intervalBox.Value = Math.Min(intervalBox.Maximum, Math.Max(intervalBox.Minimum, pendingInterval));
-                distanceBox.Value = Math.Min(distanceBox.Maximum, Math.Max(distanceBox.Minimum, pendingDistance));
-                timer.Interval = intervalBox.Value * 1000;
+                savedLocation = Location;
+                hasSavedLocation = true;
             }
-            catch { }
+        }
+
+        protected override void OnResizeEnd(EventArgs e)
+        {
+            base.OnResizeEnd(e);
+            SaveSettings();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1056,6 +1292,7 @@ namespace MouseJigglerApp
             if (e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
+                SaveSettings();
                 Hide();
                 return;
             }
@@ -1065,8 +1302,22 @@ namespace MouseJigglerApp
                 hotkeyRegistered = false;
             }
             timer.Stop();
+            SetThreadExecutionState(ES_CONTINUOUS);
+            SaveSettings();
             tray.Visible = false;
             base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                SetThreadExecutionState(ES_CONTINUOUS);
+                if (tray != null) tray.Visible = false;
+                if (trayIconOn  != null) trayIconOn.Dispose();
+                if (trayIconOff != null) trayIconOff.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }

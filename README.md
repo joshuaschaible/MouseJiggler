@@ -32,13 +32,18 @@ On first launch, Windows SmartScreen may warn that the publisher is unknown (nor
 - **Distance (px)** — how far each nudge moves. Default is 1 pixel.
 - **Hotkey** — click the pill, then press a key combo (needs Ctrl/Alt/Shift) to toggle jiggling globally. Default is Ctrl+Alt+J.
 - **Start with Windows** — flip the switch to launch the app hidden in the tray (already jiggling) at login.
+- **Always on top** — flip the switch to keep the window above other windows. On by default.
+- **Pause when active** — holds off nudging until you've been away from the mouse and keyboard for a full interval, so it never fights you mid-drag. On by default; turn it off to jiggle unconditionally.
+- **Keep screen awake** — while jiggling, tells Windows not to sleep or blank the display. On by default.
 - **Title bar** — drag anywhere on it to move the window; **–** minimizes.
 - **Close button (X)** — hides the window to the system tray. Jiggling continues if it was on.
-- **System tray icon** — right-click for:
+- **System tray icon** — a filled gradient dot while jiggling, a hollow gray ring when idle. Right-click for:
   - **Show** — bring the window back.
   - **Toggle** — start/stop without opening the window.
   - **Exit** — fully quit the app.
 - Double-clicking the tray icon also shows the window.
+- **Single instance** — launching the app again just brings the existing window to the front instead of starting a second copy. (`--silent` on an already-running instance exits quietly.)
+- **Window position** — where you leave the window is where it reopens, unless that spot is no longer on a connected monitor.
 
 ## How it works
 
@@ -50,8 +55,7 @@ Because it uses synthetic input rather than just moving the cursor, it works wit
 
 Edit `MouseJiggler.cs`, then re-run `build.bat`. Common tweaks:
 
-- **Default interval** — change `intervalBox.Value = 30` in the `MainForm` constructor.
-- **Always on top** — change `TopMost = true;` to `false`.
+- **Default interval** — change `pendingInterval = 30` in the `MainForm` field declarations (used until a value is saved).
 - **Colors** — everything lives in the `Theme` class at the top of the file (background, accents, text). Change `Violet`/`Cyan` to restyle the whole app.
 
 ## Troubleshooting
