@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -53,21 +54,180 @@ namespace MouseJigglerApp
         }
     }
 
+    static class AlphaSurface
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BITMAPINFOHEADER
+        {
+            public uint Size;
+            public int Width, Height;
+            public ushort Planes, BitCount;
+            public uint Compression, SizeImage;
+            public int XPelsPerMeter, YPelsPerMeter;
+            public uint ClrUsed, ClrImportant;
+        }
+        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr dc,
+            ref BITMAPINFOHEADER info, uint usage, out IntPtr bits, IntPtr section, uint offset);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dest, int x, int y,
+            int width, int height, IntPtr src, int sx, int sy, uint rop);
+
+        internal static Bitmap Render(Size size, Action<Graphics> paint)
+        {
+            var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb);
+            try
+            {
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.Clear(Color.Transparent);
+                    graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                    paint(graphics);
+                }
+                return bitmap;
+            }
+            catch { bitmap.Dispose(); throw; }
+        }
+
+        internal static void Paint(Graphics destination, Size size, Action<Graphics> paint)
+        {
+            if (size.Width <= 0 || size.Height <= 0) return;
+            using (var bitmap = Render(size, paint))
+            {
+                IntPtr target = destination.GetHdc();
+                IntPtr memory = IntPtr.Zero, dib = IntPtr.Zero, old = IntPtr.Zero;
+                try
+                {
+                    memory = CreateCompatibleDC(target);
+                    var info = new BITMAPINFOHEADER {
+                        Size = (uint)Marshal.SizeOf(typeof(BITMAPINFOHEADER)),
+                        Width = size.Width, Height = -size.Height, Planes = 1, BitCount = 32
+                    };
+                    IntPtr bits;
+                    dib = CreateDIBSection(target, ref info, 0, out bits, IntPtr.Zero, 0);
+                    if (memory == IntPtr.Zero || dib == IntPtr.Zero || bits == IntPtr.Zero)
+                        throw new System.ComponentModel.Win32Exception();
+                    var data = bitmap.LockBits(new Rectangle(Point.Empty, size),
+                        ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                    try
+                    {
+                        var bytes = new byte[size.Width * size.Height * 4];
+                        for (int row = 0; row < size.Height; row++)
+                            Marshal.Copy(IntPtr.Add(data.Scan0, row * data.Stride), bytes,
+                                row * size.Width * 4, size.Width * 4);
+                        Marshal.Copy(bytes, 0, bits, bytes.Length);
+                    }
+                    finally { bitmap.UnlockBits(data); }
+                    old = SelectObject(memory, dib);
+                    if (old == IntPtr.Zero || old == new IntPtr(-1))
+                        throw new System.ComponentModel.Win32Exception();
+                    if (!BitBlt(target, 0, 0, size.Width, size.Height, memory, 0, 0, 0x00CC0020))
+                        throw new System.ComponentModel.Win32Exception();
+                }
+                finally
+                {
+                    if (old != IntPtr.Zero && old != new IntPtr(-1)) SelectObject(memory, old);
+                    if (dib != IntPtr.Zero) DeleteObject(dib);
+                    if (memory != IntPtr.Zero) DeleteDC(memory);
+                    destination.ReleaseHdc(target);
+                }
+            }
+        }
+    }
+
+    class ThemedLabel : Label
+    {
+        public ThemedLabel()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.Opaque | ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, false);
+        }
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            AlphaSurface.Paint(e.Graphics, ClientSize, PaintSurface);
+        }
+        internal void PaintSurface(Graphics graphics)
+        {
+            graphics.Clear(Theme.Surface);
+            using (var brush = new SolidBrush(ForeColor))
+            using (var format = new StringFormat())
+            {
+                format.Alignment = TextAlign == ContentAlignment.MiddleCenter
+                    ? StringAlignment.Center : StringAlignment.Near;
+                format.LineAlignment = StringAlignment.Center;
+                graphics.DrawString(Text, Font, brush, ClientRectangle, format);
+            }
+        }
+    }
+
     // ---- Shared palette ----
     static class Theme
     {
-        public static readonly Color Bg            = Color.FromArgb(16, 17, 24);
-        public static readonly Color TitleDivider  = Color.FromArgb(30, 33, 48);
-        public static readonly Color Panel         = Color.FromArgb(29, 31, 42);
-        public static readonly Color PanelHover    = Color.FromArgb(38, 41, 55);
-        public static readonly Color PanelBorder   = Color.FromArgb(43, 46, 60);
-        public static readonly Color TextPrimary   = Color.FromArgb(236, 238, 245);
-        public static readonly Color TextSecondary = Color.FromArgb(154, 159, 178);
-        public static readonly Color TextDim       = Color.FromArgb(86, 91, 112);
-        public static readonly Color Violet        = Color.FromArgb(124, 92, 255);
-        public static readonly Color Cyan          = Color.FromArgb(0, 212, 255);
-        public static readonly Color RingOff       = Color.FromArgb(58, 62, 80);
-        public static readonly Color RingOffHover  = Color.FromArgb(80, 86, 110);
+        // An explicit alpha surface carries this tint over the native material.
+        internal static bool MaterialEnabled;
+        internal static Color Surface { get { return MaterialEnabled && !HighContrast
+            ? Color.FromArgb(IsDark ? 220 : 235, Bg) : Bg; } }
+        public static bool IsDark { get; private set; }
+        public static bool HighContrast { get; private set; }
+        public static Color Bg, TitleDivider, Panel, PanelHover, PanelBorder;
+        public static Color TextPrimary, TextSecondary, TextDim, Violet, Cyan;
+        public static Color RingOff, RingOffHover, ToggleThumb;
+
+        static Theme() { Refresh(); }
+
+        // Windows lets app and shell themes differ; use the app preference here.
+        public static bool Refresh()
+        {
+            bool dark = false;
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object value = key == null ? null : key.GetValue("AppsUseLightTheme");
+                    dark = value is int && (int)value == 0;
+                }
+            }
+            catch { dark = IsDark; } // Keep the current palette if access fails.
+            bool highContrast = SystemInformation.HighContrast;
+            bool changed = dark != IsDark || highContrast != HighContrast;
+            SetPalette(dark, highContrast);
+            return changed;
+        }
+
+        // Keep the preference lookup separate from rendering, so each palette can
+        // also be verified without changing the user's Windows settings.
+        internal static void SetPalette(bool dark, bool highContrast)
+        {
+            HighContrast = highContrast;
+            IsDark = dark;
+            Bg            = dark ? Color.FromArgb(27, 28, 35) : Color.FromArgb(243, 243, 247);
+            TitleDivider  = dark ? Color.FromArgb(48, 49, 60) : Color.FromArgb(222, 223, 232);
+            Panel         = dark ? Color.FromArgb(37, 39, 49) : Color.FromArgb(253, 253, 255);
+            PanelHover    = dark ? Color.FromArgb(47, 49, 62) : Color.FromArgb(234, 234, 244);
+            PanelBorder   = dark ? Color.FromArgb(63, 65, 79) : Color.FromArgb(204, 205, 219);
+            TextPrimary   = dark ? Color.FromArgb(242, 243, 249) : Color.FromArgb(30, 31, 44);
+            TextSecondary = dark ? Color.FromArgb(181, 185, 202) : Color.FromArgb(81, 85, 107);
+            TextDim       = dark ? Color.FromArgb(166, 172, 193) : Color.FromArgb(89, 94, 115);
+            Violet        = dark ? Color.FromArgb(146, 116, 255) : Color.FromArgb(112, 74, 230);
+            Cyan          = dark ? Color.FromArgb(0, 212, 255) : Color.FromArgb(0, 103, 136);
+            RingOff       = dark ? Color.FromArgb(76, 80, 100) : Color.FromArgb(181, 184, 201);
+            RingOffHover  = dark ? Color.FromArgb(120, 126, 152) : Color.FromArgb(120, 125, 152);
+            ToggleThumb   = dark ? Color.FromArgb(247, 248, 252) : Color.White;
+            if (HighContrast)
+            {
+                Bg = Panel = SystemColors.Window;
+                PanelHover = SystemColors.Control;
+                TextPrimary = TextSecondary = TextDim = SystemColors.WindowText;
+                TitleDivider = PanelBorder = RingOff = RingOffHover = SystemColors.WindowText;
+                Violet = Cyan = SystemColors.Highlight;
+                ToggleThumb = SystemColors.HighlightText;
+            }
+        }
 
         public static GraphicsPath RoundedRect(Rectangle r, int radius)
         {
@@ -99,14 +259,34 @@ namespace MouseJigglerApp
         }
     }
 
+    class ThemeMenuColors : ProfessionalColorTable
+    {
+        public ThemeMenuColors() { UseSystemColors = false; }
+        public override Color ToolStripDropDownBackground { get { return Theme.Panel; } }
+        public override Color ImageMarginGradientBegin { get { return Theme.Panel; } }
+        public override Color ImageMarginGradientMiddle { get { return Theme.Panel; } }
+        public override Color ImageMarginGradientEnd { get { return Theme.Panel; } }
+        public override Color MenuItemSelected { get { return Theme.PanelHover; } }
+        public override Color MenuItemBorder { get { return Theme.PanelBorder; } }
+        public override Color MenuBorder { get { return Theme.PanelBorder; } }
+        public override Color SeparatorDark { get { return Theme.TitleDivider; } }
+        public override Color SeparatorLight { get { return Theme.Panel; } }
+    }
+
     // ---- Base for flicker-free custom-drawn controls ----
     class CustomControl : Control
     {
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            AlphaSurface.Paint(e.Graphics, ClientSize, PaintSurface);
+        }
+        protected virtual void PaintSurface(Graphics graphics) { }
         public CustomControl()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.UserPaint |
-                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.Opaque |
                      ControlStyles.ResizeRedraw, true);
         }
     }
@@ -127,21 +307,25 @@ namespace MouseJigglerApp
         protected override void OnMouseEnter(EventArgs e) { hover = true;  Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void PaintSurface(Graphics g)
         {
-            var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            // Extended DWM frames still draw native caption glyphs underneath
+            // the client. The custom header must occlude those pixels completely,
+            // including each separate child HWND used for our title buttons.
+            g.Clear(Theme.Bg);
 
             if (hover)
             {
-                var bg = isClose ? Color.FromArgb(196, 63, 78) : Theme.PanelHover;
+                var bg = Theme.HighContrast ? SystemColors.Highlight
+                    : (isClose ? Color.FromArgb(196, 63, 78) : Theme.PanelHover);
                 using (var b = new SolidBrush(bg))
                 using (var p = Theme.RoundedRect(new Rectangle(3, 3, Width - 7, Height - 7), 6))
                     g.FillPath(b, p);
             }
 
-            var glyph = hover ? Theme.TextPrimary : Theme.TextSecondary;
+            var glyph = hover && Theme.HighContrast ? SystemColors.HighlightText
+                : (hover && isClose ? Color.White : (hover ? Theme.TextPrimary : Theme.TextSecondary));
             using (var pen = new Pen(glyph, 1.6f))
             {
                 pen.StartCap = LineCap.Round;
@@ -190,16 +374,15 @@ namespace MouseJigglerApp
         protected override void OnMouseDown(MouseEventArgs e) { pressed = true;  Invalidate(); base.OnMouseDown(e); }
         protected override void OnMouseUp(MouseEventArgs e)   { pressed = false; Invalidate(); base.OnMouseUp(e); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void PaintSurface(Graphics g)
         {
-            var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            g.Clear(Theme.Surface);
 
             int cx = Width / 2, cy = Height / 2;
 
             // Soft outer glow while active, breathing with the pulse phase
-            if (active)
+            if (active && !Theme.HighContrast)
             {
                 int alpha = (int)(45 + 55 * pulse);
                 using (var glowPath = new GraphicsPath())
@@ -232,7 +415,7 @@ namespace MouseJigglerApp
             }
 
             // Power glyph: open arc + stem through the gap
-            var glyphColor = active ? Theme.TextPrimary : (hover ? Theme.TextSecondary : Color.FromArgb(122, 127, 150));
+            var glyphColor = active ? Theme.TextPrimary : (hover ? Theme.TextSecondary : Theme.TextDim);
             using (var pen = new Pen(glyphColor, 3f))
             {
                 pen.StartCap = LineCap.Round;
@@ -343,11 +526,16 @@ namespace MouseJigglerApp
             repeatCount = 0;
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            var g = e.Graphics;
+            if (disposing) repeat.Dispose();
+            base.Dispose(disposing);
+        }
+
+        protected override void PaintSurface(Graphics g)
+        {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            g.Clear(Theme.Surface);
 
             var body = new Rectangle(0, 0, Width - 1, Height - 1);
             using (var path = Theme.RoundedRect(body, 8))
@@ -380,8 +568,8 @@ namespace MouseJigglerApp
 
             using (var f = new Font("Segoe UI Semibold", 9.5f))
             using (var b = new SolidBrush(Theme.TextPrimary))
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             {
-                var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
                 g.DrawString(val.ToString(), f, b,
                     new Rectangle(ZoneW, 0, Width - ZoneW * 2, Height), sf);
             }
@@ -403,11 +591,10 @@ namespace MouseJigglerApp
         protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
         protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void PaintSurface(Graphics g)
         {
-            var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            g.Clear(Theme.Surface);
 
             var body = new Rectangle(0, 0, Width - 1, Height - 1);
             using (var path = Theme.RoundedRect(body, 8))
@@ -418,14 +605,14 @@ namespace MouseJigglerApp
 
             using (var f = new Font("Segoe UI", 8.75f))
             using (var b = new SolidBrush(hover ? Theme.TextPrimary : Theme.TextSecondary))
+            using (var sf = new StringFormat
             {
-                var sf = new StringFormat
-                {
-                    Alignment = StringAlignment.Center,
-                    LineAlignment = StringAlignment.Center,
-                    Trimming = StringTrimming.EllipsisCharacter,
-                    FormatFlags = StringFormatFlags.NoWrap
-                };
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center,
+                Trimming = StringTrimming.EllipsisCharacter,
+                FormatFlags = StringFormatFlags.NoWrap
+            })
+            {
                 g.DrawString(Text, f, b, new Rectangle(4, 0, Width - 8, Height), sf);
             }
         }
@@ -474,18 +661,28 @@ namespace MouseJigglerApp
             base.OnClick(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            var g = e.Graphics;
+            if (disposing) anim.Dispose();
+            base.Dispose(disposing);
+        }
+
+        protected override void PaintSurface(Graphics g)
+        {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            g.Clear(Theme.Surface);
 
             var body = new Rectangle(0, 0, Width - 1, Height - 1);
             using (var path = Theme.RoundedRect(body, (Height - 1) / 2))
             {
                 // Off-gray track, with the accent gradient fading in as the thumb travels
-                using (var off = new SolidBrush(Theme.PanelBorder)) g.FillPath(off, path);
-                if (pos > 0.01f)
+                using (var off = new SolidBrush(Theme.RingOff)) g.FillPath(off, path);
+                if (Theme.HighContrast)
+                {
+                    using (var on = new SolidBrush(isChecked ? SystemColors.Highlight : Theme.RingOff))
+                        g.FillPath(on, path);
+                }
+                else if (pos > 0.01f)
                 {
                     int a = (int)(255 * pos);
                     using (var lgb = new LinearGradientBrush(body,
@@ -497,8 +694,124 @@ namespace MouseJigglerApp
             int thumbD = Height - 7;
             float travel = Width - thumbD - 7;
             float tx = 3 + pos * travel;
-            using (var b = new SolidBrush(Color.FromArgb(245, 246, 250)))
+            var thumb = Theme.HighContrast
+                ? (isChecked ? SystemColors.HighlightText : SystemColors.Window) : Theme.ToggleThumb;
+            using (var b = new SolidBrush(thumb))
                 g.FillEllipse(b, tx, 3, thumbD, thumbD);
+        }
+    }
+
+    // Geometry is independent of live displays so irregular layouts can be tested.
+    static class WindowPlacement
+    {
+        public static Rectangle Clamp(Rectangle window, Rectangle workArea)
+        {
+            int x = Math.Max(workArea.Left, Math.Min(window.X,
+                workArea.Left + Math.Max(0, workArea.Width - window.Width)));
+            int y = Math.Max(workArea.Top, Math.Min(window.Y,
+                workArea.Top + Math.Max(0, workArea.Height - window.Height)));
+            return new Rectangle(x, y, window.Width, window.Height);
+        }
+
+        public static Rectangle Center(Rectangle window, Rectangle workArea)
+        {
+            return Clamp(new Rectangle(workArea.Left + (workArea.Width - window.Width) / 2,
+                workArea.Top + (workArea.Height - window.Height) / 2,
+                window.Width, window.Height), workArea);
+        }
+
+        public static int FindScreen(Rectangle window, Rectangle[] workAreas)
+        {
+            int best = -1;
+            double bestArea = -1, bestDistance = double.MaxValue;
+            double cx = (double)window.X + window.Width / 2.0;
+            double cy = (double)window.Y + window.Height / 2.0;
+            for (int i = 0; i < workAreas.Length; i++)
+            {
+                Rectangle area = workAreas[i];
+                // Use doubles for corrupt/stale saved coordinates near int limits.
+                double width = Math.Max(0, Math.Min((double)window.X + window.Width,
+                    (double)area.X + area.Width) - Math.Max(window.X, area.X));
+                double height = Math.Max(0, Math.Min((double)window.Y + window.Height,
+                    (double)area.Y + area.Height) - Math.Max(window.Y, area.Y));
+                double overlap = width * height;
+                double dx = cx - ((double)area.X + area.Width / 2.0);
+                double dy = cy - ((double)area.Y + area.Height / 2.0);
+                double distance = dx * dx + dy * dy;
+                if (overlap > bestArea || (overlap == bestArea && distance < bestDistance))
+                {
+                    best = i;
+                    bestArea = overlap;
+                    bestDistance = distance;
+                }
+            }
+            return best;
+        }
+
+        public static int FindScreenInDirection(int current, Rectangle[] workAreas, Keys direction)
+        {
+            if (current < 0 || current >= workAreas.Length) return -1;
+            Rectangle source = workAreas[current];
+            double cx = (double)source.X + source.Width / 2.0;
+            double cy = (double)source.Y + source.Height / 2.0;
+            int best = -1;
+            double bestScore = double.MaxValue;
+            bool bestAligned = false;
+            for (int i = 0; i < workAreas.Length; i++)
+            {
+                if (i == current) continue;
+                Rectangle target = workAreas[i];
+                double dx = (double)target.X + target.Width / 2.0 - cx;
+                double dy = (double)target.Y + target.Height / 2.0 - cy;
+                double forward, sideways;
+                bool aligned;
+                switch (direction)
+                {
+                    case Keys.Left:
+                        if ((double)target.X + target.Width > source.X) continue;
+                        forward = -dx; sideways = Math.Abs(dy);
+                        aligned = target.Top < source.Bottom && target.Bottom > source.Top;
+                        break;
+                    case Keys.Right:
+                        if (target.X < (double)source.X + source.Width) continue;
+                        forward = dx; sideways = Math.Abs(dy);
+                        aligned = target.Top < source.Bottom && target.Bottom > source.Top;
+                        break;
+                    case Keys.Up:
+                        if ((double)target.Y + target.Height > source.Y) continue;
+                        forward = -dy; sideways = Math.Abs(dx);
+                        aligned = target.Left < source.Right && target.Right > source.Left;
+                        break;
+                    case Keys.Down:
+                        if (target.Y < (double)source.Y + source.Height) continue;
+                        forward = dy; sideways = Math.Abs(dx);
+                        aligned = target.Left < source.Right && target.Right > source.Left;
+                        break;
+                    default: return -1;
+                }
+                if (forward <= 0) continue;
+                // Prefer nearby displays aligned with the requested direction.
+                double score = forward + sideways * 2;
+                if ((aligned && !bestAligned) || (aligned == bestAligned && score < bestScore))
+                {
+                    best = i;
+                    bestScore = score;
+                    bestAligned = aligned;
+                }
+            }
+            return best;
+        }
+
+        public static Rectangle Move(Rectangle window, Rectangle source, Rectangle target)
+        {
+            Rectangle visible = Clamp(window, source);
+            int sourceTravelX = Math.Max(0, source.Width - window.Width);
+            int sourceTravelY = Math.Max(0, source.Height - window.Height);
+            double x = sourceTravelX == 0 ? 0.5 : (double)(visible.X - source.X) / sourceTravelX;
+            double y = sourceTravelY == 0 ? 0.5 : (double)(visible.Y - source.Y) / sourceTravelY;
+            return Clamp(new Rectangle(target.X + (int)Math.Round(x * Math.Max(0, target.Width - window.Width)),
+                target.Y + (int)Math.Round(y * Math.Max(0, target.Height - window.Height)),
+                window.Width, window.Height), target);
         }
     }
 
@@ -533,9 +846,28 @@ namespace MouseJigglerApp
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
         // ---- Rounded window ----
         [DllImport("gdi32.dll")]
         private static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int w, int h);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MARGINS
+        {
+            public int Left, Right, Top, Bottom;
+            public MARGINS(int value) { Left = Right = Top = Bottom = value; }
+        }
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmIsCompositionEnabled(out bool enabled);
 
         // ---- Idle detection ----
         [StructLayout(LayoutKind.Sequential)]
@@ -565,14 +897,20 @@ namespace MouseJigglerApp
 
         private const int WM_HOTKEY = 0x0312;
         private const int WM_NCHITTEST = 0x0084;
+        private const int WM_NCCALCSIZE = 0x0083;
+        private const int WM_GETMINMAXINFO = 0x0024;
+        private const int WM_WINDOWPOSCHANGING = 0x0046;
+        private const int WM_SYSCOMMAND = 0x0112;
         private const int HTCLIENT = 1;
         private const int HTCAPTION = 2;
         private const int HOTKEY_ID = 0xA731;
+        private const int RECOVERY_HOTKEY_ID = 0xA732;
 
         private const uint MOD_ALT     = 0x0001;
         private const uint MOD_CONTROL = 0x0002;
         private const uint MOD_SHIFT   = 0x0004;
         private const uint MOD_WIN     = 0x0008;
+        private const uint MOD_NOREPEAT = 0x4000;
 
         private const uint INPUT_MOUSE = 0;
         private const uint MOUSEEVENTF_MOVE = 0x0001;
@@ -587,6 +925,7 @@ namespace MouseJigglerApp
         // ---- UI ----
         private readonly Timer timer;
         private readonly Timer animTimer;
+        private readonly Timer placementSaveTimer;
         private readonly Label status;
         private readonly PowerButton powerButton;
         private readonly Stepper intervalBox;
@@ -597,8 +936,10 @@ namespace MouseJigglerApp
         private readonly ToggleSwitch idleCheck;
         private readonly ToggleSwitch awakeCheck;
         private readonly NotifyIcon tray;
-        private readonly Icon trayIconOn;
-        private readonly Icon trayIconOff;
+        private Icon trayIconOn;
+        private Icon trayIconOff;
+        private bool themeReady;
+        private bool backdropEnabled;
         private bool direction = false;
         private double pulsePhase = 0;
 
@@ -607,10 +948,11 @@ namespace MouseJigglerApp
         private Keys hotkeyKey  = Keys.J;
         private bool capturingHotkey = false;
         private bool hotkeyRegistered = false;
+        private bool recoveryHotkeyRegistered = false;
+        private ToolStripMenuItem recoveryHintItem;
 
         // ---- Startup behavior ----
         private bool startHidden = false;
-        private bool autoStartJiggling = false;
         private bool alwaysOnTop = true;
         private bool pauseWhenActive = true;
         private bool keepAwake = true;
@@ -624,12 +966,30 @@ namespace MouseJigglerApp
         // ---- Window placement ----
         private Point savedLocation = Point.Empty;
         private bool hasSavedLocation = false;
+        private Size compactWindowSize;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MINMAXINFO
+        {
+            public Point Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINDOWPOS
+        {
+            public IntPtr Hwnd, InsertAfter;
+            public int X, Y, Width, Height, Flags;
+        }
 
         protected override CreateParams CreateParams
         {
             get
             {
                 var cp = base.CreateParams;
+                // Keep a normal shell window, even though we draw our own frame.
+                // Removing these styles also removes standard monitor movement.
+                cp.Style &= unchecked((int)~0x80000000u); // WS_POPUP
+                cp.Style |= 0x00CF0000; // WS_OVERLAPPEDWINDOW
                 cp.ClassStyle |= 0x20000; // CS_DROPSHADOW
                 return cp;
             }
@@ -637,30 +997,36 @@ namespace MouseJigglerApp
 
         public MainForm(bool silent)
         {
+            Theme.Refresh();
             LoadSettings();
 
             if (silent)
             {
                 startHidden = true;
-                autoStartJiggling = true;
             }
 
             Text = "Mouse Jiggler";
-            ClientSize = new Size(300, 568);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
             MaximizeBox = false;
+            // WM_NCCALCSIZE makes the whole window client area. ClientSize would
+            // otherwise add the hidden standard frame when calculating Size.
+            Size = new Size(300, 590);
+            compactWindowSize = Size;
             TopMost = alwaysOnTop;
             BackColor = Theme.Bg;
-            DoubleBuffered = true;
-            Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 18, 18));
+            DoubleBuffered = false;
+            SetOpaqueRegion();
 
-            // Restore the last window position, but only if it still lands on a
-            // connected monitor (a disconnected second screen would strand it).
-            if (hasSavedLocation && IsOnScreen(new Rectangle(savedLocation, Size)))
+            // Clamp stale or partially offscreen positions into a connected display.
+            if (hasSavedLocation)
             {
+                Rectangle[] workAreas = GetWorkingAreas();
+                Rectangle bounds = new Rectangle(savedLocation, Size);
+                int screen = WindowPlacement.FindScreen(bounds, workAreas);
                 StartPosition = FormStartPosition.Manual;
-                Location = savedLocation;
+                if (screen >= 0) Location = WindowPlacement.Clamp(bounds, workAreas[screen]).Location;
+                savedLocation = Location;
             }
 
             // App icon (taskbar / Alt+Tab)
@@ -673,7 +1039,7 @@ namespace MouseJigglerApp
             Controls.Add(minButton);
 
             var closeButton = new TitleButton(true) { Location = new Point(Width - 44, 7) };
-            closeButton.Click += delegate { Hide(); };
+            closeButton.Click += delegate { SaveSettings(); Hide(); };
             Controls.Add(closeButton);
 
             // -- Power button --
@@ -685,15 +1051,15 @@ namespace MouseJigglerApp
             powerButton.Click += delegate { Toggle(); };
             Controls.Add(powerButton);
 
-            status = new Label
+            status = new ThemedLabel
             {
                 Text = "IDLE",
                 Font = new Font("Segoe UI Semibold", 13f),
                 ForeColor = Theme.TextDim,
                 BackColor = Theme.Bg,
                 TextAlign = ContentAlignment.MiddleCenter,
-                Size = new Size(Width, 28),
-                Location = new Point(0, 198)
+                Size = new Size(Width - 2, 28),
+                Location = new Point(1, 198)
             };
             Controls.Add(status);
 
@@ -802,14 +1168,15 @@ namespace MouseJigglerApp
             };
             Controls.Add(awakeCheck);
 
-            var hint = new Label
+            var hint = new ThemedLabel
             {
-                Text = "Close hides to tray  ·  right-click tray icon to quit",
+                Text = "Alt + arrows: move  ·  Ctrl + Alt + Home: recover\nClose hides to tray  ·  right-click tray to quit",
+                Tag = "Hint",
                 ForeColor = Theme.TextDim,
                 BackColor = Theme.Bg,
                 Font = new Font("Segoe UI", 8f),
-                Location = new Point(0, Height - 30),
-                Size = new Size(Width, 20),
+                Location = new Point(1, Height - 50),
+                Size = new Size(Width - 2, 40),
                 TextAlign = ContentAlignment.MiddleCenter
             };
             Controls.Add(hint);
@@ -825,14 +1192,21 @@ namespace MouseJigglerApp
                 powerButton.Pulse = (float)(0.5 + 0.5 * Math.Sin(pulsePhase));
             };
 
+            // Shell monitor moves need persistence too; coalesce move events
+            // so dragging does not write settings for every pixel.
+            placementSaveTimer = new Timer { Interval = 250 };
+            placementSaveTimer.Tick += delegate { placementSaveTimer.Stop(); SaveSettings(); };
+
             var trayMenu = new ContextMenuStrip();
-            var showItem = new ToolStripMenuItem("Show");
+            var showItem = new ToolStripMenuItem("Show on this monitor");
             showItem.Click += delegate { ShowFromTray(); };
+            recoveryHintItem = new ToolStripMenuItem("Recover window: Ctrl+Alt+Home") { Enabled = false };
             var toggleItem = new ToolStripMenuItem("Toggle");
             toggleItem.Click += delegate { Toggle(); };
             var exitItem = new ToolStripMenuItem("Exit");
             exitItem.Click += delegate { tray.Visible = false; Application.Exit(); };
             trayMenu.Items.Add(showItem);
+            trayMenu.Items.Add(recoveryHintItem);
             trayMenu.Items.Add(toggleItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exitItem);
@@ -848,33 +1222,168 @@ namespace MouseJigglerApp
                 ContextMenuStrip = trayMenu
             };
             tray.DoubleClick += delegate { ShowFromTray(); };
-
-            Load += delegate
+            themeReady = true;
+            if (!IsHandleCreated) { IntPtr windowHandle = Handle; }
+            else
             {
-                RegisterAppHotkey();
-                if (autoStartJiggling) Toggle();
-            };
+                ApplyTheme();
+                RegisterWindowHotkeys();
+            }
+
+            // Load waits until the first visible show. Start here so a silent
+            // launch jiggles immediately and later showing it cannot retoggle.
+            if (silent) Toggle();
+        }
+
+        private void SetOpaqueRegion()
+        {
+            IntPtr roundedRegion = CreateRoundRectRgn(0, 0, Width + 1, Height + 1, 16, 16);
+            if (roundedRegion == IntPtr.Zero) return;
+            try
+            {
+                Region old = Region;
+                Region = Region.FromHrgn(roundedRegion);
+                if (old != null) old.Dispose();
+            }
+            finally { DeleteObject(roundedRegion); }
+        }
+
+        private static bool TransparencyAllowed()
+        {
+            if (Theme.HighContrast || SystemInformation.TerminalServerSession) return false;
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object value = key == null ? null : key.GetValue("EnableTransparency");
+                    return !(value is int) || (int)value != 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        private void ApplyBackdrop()
+        {
+            if (!IsHandleCreated) return;
+            bool enabled = false;
+            try
+            {
+                bool composition;
+                bool allowed = TransparencyAllowed() &&
+                    DwmIsCompositionEnabled(out composition) == 0 && composition;
+                int dark = Theme.IsDark ? 1 : 0;
+                DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
+                int material = allowed ? 3 : 1; // Desktop Acrylic / no backdrop
+                bool supported = DwmSetWindowAttribute(Handle, 38, ref material, sizeof(int)) == 0;
+                var margins = new MARGINS(allowed && supported ? -1 : 0);
+                enabled = allowed && supported &&
+                    DwmExtendFrameIntoClientArea(Handle, ref margins) == 0;
+                if (!enabled)
+                {
+                    material = 1;
+                    DwmSetWindowAttribute(Handle, 38, ref material, sizeof(int));
+                    margins = new MARGINS(0);
+                    DwmExtendFrameIntoClientArea(Handle, ref margins);
+                }
+                int corners = 2;
+                DwmSetWindowAttribute(Handle, 33, ref corners, sizeof(int));
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+
+            backdropEnabled = Theme.MaterialEnabled = enabled;
+            if (enabled)
+            {
+                Region old = Region;
+                Region = null;
+                if (old != null) old.Dispose();
+            }
+            else SetOpaqueRegion();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (themeReady && !backdropEnabled && Width > 0 && Height > 0) SetOpaqueRegion();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (themeReady)
+            {
+                ApplyTheme();
+                RegisterWindowHotkeys();
+            }
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            UnregisterWindowHotkeys();
+            base.OnHandleDestroyed(e);
+        }
+
+        private void ApplyTheme()
+        {
+            ApplyBackdrop();
+            BackColor = Theme.Bg;
+            foreach (Control control in Controls)
+            {
+                control.BackColor = Theme.Bg;
+                if (control is Label)
+                    control.ForeColor = control == status
+                        ? (timer.Enabled ? Theme.Cyan : Theme.TextDim)
+                        : ((string)control.Tag == "Hint" ? Theme.TextDim : Theme.TextSecondary);
+                control.Invalidate();
+            }
+            var menu = tray.ContextMenuStrip;
+            menu.Renderer = new ToolStripProfessionalRenderer(new ThemeMenuColors());
+            menu.BackColor = Theme.Panel;
+            menu.ForeColor = Theme.TextPrimary;
+            foreach (ToolStripItem item in menu.Items) item.ForeColor = Theme.TextPrimary;
+            menu.Invalidate();
+
+            Icon oldOn = trayIconOn, oldOff = trayIconOff;
+            trayIconOn = MakeTrayIcon(true);
+            trayIconOff = MakeTrayIcon(false);
+            tray.Icon = (timer.Enabled ? trayIconOn : trayIconOff) ?? Icon ?? SystemIcons.Application;
+            if (oldOn != null) oldOn.Dispose();
+            if (oldOff != null) oldOff.Dispose();
+            Invalidate(true);
         }
 
         private void AddRowLabel(string text, int x, int y, int rowH)
         {
-            Controls.Add(new Label
+            Controls.Add(new ThemedLabel
             {
                 Text = text,
                 ForeColor = Theme.TextSecondary,
                 BackColor = Theme.Bg,
                 Font = new Font("Segoe UI", 9.25f),
                 Location = new Point(x, y),
-                Size = new Size(130, rowH),
+                Size = new Size(120, rowH),
                 TextAlign = ContentAlignment.MiddleLeft
             });
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e) { }
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
-            var g = e.Graphics;
+            AlphaSurface.Paint(e.Graphics, ClientSize, PaintForm);
+        }
+        private void PaintForm(Graphics g)
+        {
+            g.Clear(Theme.Surface);
+            // WM_NCCALCSIZE removes the ordinary frame geometry, but not a frame
+            // extended by DwmExtendFrameIntoClientArea. Keep native shell styles
+            // and Acrylic for the body; cover its native caption with alpha 255.
+            using (var header = new SolidBrush(Theme.Bg))
+                g.FillRectangle(header, 0, 0, ClientSize.Width, TitleBarHeight);
             g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            using (var outline = Theme.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 8))
+            using (var pen = new Pen(Theme.PanelBorder)) g.DrawPath(pen, outline);
 
             // Logo dot + title
             var dotRect = new Rectangle(20, 17, 10, 10);
@@ -908,12 +1417,100 @@ namespace MouseJigglerApp
 
         private void ShowFromTray()
         {
+            // The tray, global recovery shortcut, and reopening all recover onto
+            // the monitor under the pointer, even if the old monitor is connected.
+            Rectangle bounds = NormalWindowBounds();
+            Rectangle workArea = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Rectangle target = workArea.Contains(bounds) ? bounds : WindowPlacement.Center(bounds, workArea);
+            // Showing a hidden minimized form first is essential: WinForms can
+            // defer a WindowState change while hidden and keep the native icon.
             Show();
             WindowState = FormWindowState.Normal;
+            Bounds = target;
             Activate();
+            RememberWindowLocation();
+        }
+
+        private Rectangle NormalWindowBounds()
+        {
+            Rectangle bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            Size normalSize = compactWindowSize.IsEmpty ? Size : compactWindowSize;
+            if (bounds.Width <= 0 || bounds.Height <= 0 ||
+                (bounds.X <= -30000 && bounds.Y <= -30000 &&
+                 bounds.Width < normalSize.Width && bounds.Height < normalSize.Height))
+                return new Rectangle(hasSavedLocation ? savedLocation : Location, normalSize);
+            return new Rectangle(bounds.Location, normalSize);
+        }
+
+        private static Rectangle[] GetWorkingAreas()
+        {
+            Screen[] screens = Screen.AllScreens;
+            var areas = new Rectangle[screens.Length];
+            for (int i = 0; i < screens.Length; i++) areas[i] = screens[i].WorkingArea;
+            return areas;
+        }
+
+        private void RememberWindowLocation()
+        {
+            if (placementSaveTimer != null) placementSaveTimer.Stop();
+            savedLocation = NormalWindowBounds().Location;
+            hasSavedLocation = true;
+            SaveSettings();
+        }
+
+        private void MoveToMonitor(Keys direction)
+        {
+            Rectangle[] areas = GetWorkingAreas();
+            Rectangle bounds = NormalWindowBounds();
+            int current = WindowPlacement.FindScreen(bounds, areas);
+            int target = WindowPlacement.FindScreenInDirection(current, areas, direction);
+            if (target < 0) return;
+            Bounds = WindowPlacement.Move(bounds, areas[current], areas[target]);
+            RememberWindowLocation();
+        }
+
+        private void EnsureWindowVisible()
+        {
+            if (IsDisposed || Disposing) return;
+            Rectangle bounds = NormalWindowBounds();
+            Rectangle[] areas = GetWorkingAreas();
+            int screen = WindowPlacement.FindScreen(bounds, areas);
+            if (screen < 0) return;
+            Rectangle visible = WindowPlacement.Clamp(bounds, areas[screen]);
+            if (visible == bounds) return;
+            // WinForms updates restoredWindowBounds when bounds are assigned
+            // while minimized. Changing visibility/state first can accidentally
+            // capture the minimized icon rectangle as the normal restore size.
+            Bounds = visible;
+            savedLocation = visible.Location;
+            hasSavedLocation = true;
+            if (placementSaveTimer != null) placementSaveTimer.Stop();
+            SaveSettings();
         }
 
         // ---- Hotkey ----
+        private void RegisterWindowHotkeys()
+        {
+            if (!themeReady || !IsHandleCreated) return;
+            RegisterAppHotkey();
+            if (recoveryHotkeyRegistered) return;
+            recoveryHotkeyRegistered = RegisterHotKey(Handle, RECOVERY_HOTKEY_ID,
+                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, (uint)Keys.Home);
+            recoveryHintItem.Text = recoveryHotkeyRegistered
+                ? "Recover window: Ctrl+Alt+Home"
+                : "Ctrl+Alt+Home unavailable; use Show";
+        }
+
+        private void UnregisterWindowHotkeys()
+        {
+            if (IsHandleCreated)
+            {
+                if (hotkeyRegistered) UnregisterHotKey(Handle, HOTKEY_ID);
+                if (recoveryHotkeyRegistered) UnregisterHotKey(Handle, RECOVERY_HOTKEY_ID);
+            }
+            hotkeyRegistered = recoveryHotkeyRegistered = false;
+        }
+
         private void RegisterAppHotkey()
         {
             if (hotkeyRegistered)
@@ -923,11 +1520,16 @@ namespace MouseJigglerApp
             }
             if (hotkeyKey == Keys.None) return;
 
-            bool ok = RegisterHotKey(Handle, HOTKEY_ID, hotkeyMods, (uint)hotkeyKey);
+            // Recovery has its own fixed shortcut and cannot become the jiggle toggle.
+            bool recovery = hotkeyMods == (MOD_CONTROL | MOD_ALT) && hotkeyKey == Keys.Home;
+            bool movement = hotkeyMods == MOD_ALT && IsArrowKey(hotkeyKey);
+            bool reserved = recovery || movement;
+            bool ok = !reserved && RegisterHotKey(Handle, HOTKEY_ID, hotkeyMods | MOD_NOREPEAT, (uint)hotkeyKey);
             hotkeyRegistered = ok;
             if (!ok)
             {
-                hotkeyButton.Text = FormatHotkey(hotkeyMods, hotkeyKey) + " (in use)";
+                hotkeyButton.Text = FormatHotkey(hotkeyMods, hotkeyKey) +
+                    (recovery ? " (recovery)" : (movement ? " (move screen)" : " (in use)"));
             }
             else
             {
@@ -975,6 +1577,17 @@ namespace MouseJigglerApp
                     return true;
                 }
 
+                if (m == (MOD_CONTROL | MOD_ALT) && k == Keys.Home)
+                {
+                    hotkeyButton.Text = "Reserved for recovery";
+                    return true;
+                }
+                if (m == MOD_ALT && IsArrowKey(k))
+                {
+                    hotkeyButton.Text = "Reserved for moving";
+                    return true;
+                }
+
                 hotkeyMods = m;
                 hotkeyKey  = k;
                 capturingHotkey = false;
@@ -982,14 +1595,75 @@ namespace MouseJigglerApp
                 RegisterAppHotkey();
                 return true;
             }
+
+            // Only consume this while Mouse Jiggler has keyboard focus. Other
+            // applications keep their usual Alt+arrow navigation shortcuts.
+            Keys direction = keyData & Keys.KeyCode;
+            if ((keyData & Keys.Modifiers) == Keys.Alt &&
+                IsArrowKey(direction))
+            {
+                MoveToMonitor(direction);
+                return true;
+            }
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
         protected override void WndProc(ref Message m)
         {
+            // Retain native window capabilities but draw the entire compact
+            // surface ourselves, without a second standard caption/border.
+            if (m.Msg == WM_NCCALCSIZE)
+            {
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_GETMINMAXINFO && !compactWindowSize.IsEmpty)
+            {
+                base.WndProc(ref m);
+                var sizes = (MINMAXINFO)Marshal.PtrToStructure(m.LParam, typeof(MINMAXINFO));
+                sizes.MinTrackSize = sizes.MaxTrackSize = new Point(compactWindowSize.Width, compactWindowSize.Height);
+                sizes.MaxSize = sizes.MinTrackSize;
+                Marshal.StructureToPtr(sizes, m.LParam, false);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            if (m.Msg == WM_WINDOWPOSCHANGING && !compactWindowSize.IsEmpty &&
+                WindowState == FormWindowState.Normal && !IsIconic(Handle))
+            {
+                var position = (WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(WINDOWPOS));
+                if ((position.Flags & 0x0001) == 0) // SWP_NOSIZE
+                {
+                    position.Width = compactWindowSize.Width;
+                    position.Height = compactWindowSize.Height;
+                    Marshal.StructureToPtr(position, m.LParam, false);
+                }
+            }
+            if (m.Msg == WM_SYSCOMMAND)
+            {
+                long command = m.WParam.ToInt64() & 0xFFF0;
+                if (command == 0xF000 || command == 0xF030) // SC_SIZE / SC_MAXIMIZE
+                {
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+            }
+
+            // Broadcasts arrive on the UI thread, including while hidden in the tray.
+            if (themeReady && (m.Msg == 0x001A || m.Msg == 0x031A ||
+                m.Msg == 0x031E || m.Msg == 0x0218)) // settings, theme, composition, power
+            {
+                Theme.Refresh();
+                ApplyTheme();
+            }
+
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 Toggle();
+            }
+            else if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == RECOVERY_HOTKEY_ID)
+            {
+                ShowFromTray();
+                return;
             }
 
             // A second copy of the app was launched; surface this window instead.
@@ -1001,19 +1675,25 @@ namespace MouseJigglerApp
 
             if (m.Msg == WM_NCHITTEST)
             {
-                base.WndProc(ref m);
-                if (m.Result.ToInt64() == HTCLIENT)
-                {
-                    long lp = m.LParam.ToInt64();
-                    int x = (short)(lp & 0xFFFF);
-                    int y = (short)((lp >> 16) & 0xFFFF);
-                    var p = PointToClient(new Point(x, y));
-                    if (p.Y < TitleBarHeight) m.Result = (IntPtr)HTCAPTION;
-                }
+                long lp = m.LParam.ToInt64();
+                int x = (short)(lp & 0xFFFF);
+                int y = (short)((lp >> 16) & 0xFFFF);
+                var p = PointToClient(new Point(x, y));
+                bool title = p.X >= 0 && p.X < ClientSize.Width &&
+                    p.Y >= 0 && p.Y < TitleBarHeight && !(GetChildAtPoint(p) is TitleButton);
+                m.Result = (IntPtr)(title ? HTCAPTION : HTCLIENT);
                 return;
             }
 
             base.WndProc(ref m);
+            if (themeReady && IsHandleCreated && !Disposing && (m.Msg == 0x007E ||
+                (m.Msg == 0x001A && m.WParam.ToInt64() == 0x002F))) // display/work area changed
+                BeginInvoke(new MethodInvoker(EnsureWindowVisible));
+        }
+
+        private static bool IsArrowKey(Keys key)
+        {
+            return key == Keys.Left || key == Keys.Right || key == Keys.Up || key == Keys.Down;
         }
 
         private static string FormatHotkey(uint mods, Keys key)
@@ -1185,13 +1865,6 @@ namespace MouseJigglerApp
             catch { return null; }
         }
 
-        private static bool IsOnScreen(Rectangle bounds)
-        {
-            foreach (var s in Screen.AllScreens)
-                if (s.WorkingArea.IntersectsWith(bounds)) return true;
-            return false;
-        }
-
         private void ApplyExecutionState()
         {
             try
@@ -1278,12 +1951,18 @@ namespace MouseJigglerApp
             {
                 savedLocation = Location;
                 hasSavedLocation = true;
+                if (themeReady && placementSaveTimer != null)
+                {
+                    placementSaveTimer.Stop();
+                    placementSaveTimer.Start();
+                }
             }
         }
 
         protected override void OnResizeEnd(EventArgs e)
         {
             base.OnResizeEnd(e);
+            if (placementSaveTimer != null) placementSaveTimer.Stop();
             SaveSettings();
         }
 
@@ -1296,11 +1975,7 @@ namespace MouseJigglerApp
                 Hide();
                 return;
             }
-            if (hotkeyRegistered)
-            {
-                UnregisterHotKey(Handle, HOTKEY_ID);
-                hotkeyRegistered = false;
-            }
+            UnregisterWindowHotkeys();
             timer.Stop();
             SetThreadExecutionState(ES_CONTINUOUS);
             SaveSettings();
@@ -1314,6 +1989,14 @@ namespace MouseJigglerApp
             {
                 SetThreadExecutionState(ES_CONTINUOUS);
                 if (tray != null) tray.Visible = false;
+                if (tray != null)
+                {
+                    if (tray.ContextMenuStrip != null) tray.ContextMenuStrip.Dispose();
+                    tray.Dispose();
+                }
+                if (timer != null) timer.Dispose();
+                if (animTimer != null) animTimer.Dispose();
+                if (placementSaveTimer != null) placementSaveTimer.Dispose();
                 if (trayIconOn  != null) trayIconOn.Dispose();
                 if (trayIconOff != null) trayIconOff.Dispose();
             }
