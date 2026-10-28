@@ -3,7 +3,9 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -11,6 +13,7 @@ namespace MouseJigglerApp
 {
     static class Program
     {
+        internal static bool StreamDeckEnabled;
         [DllImport("user32.dll")]
         private static extern int RegisterWindowMessage(string lpString);
 
@@ -30,11 +33,15 @@ namespace MouseJigglerApp
             Application.SetCompatibleTextRenderingDefault(false);
 
             bool silent = false;
+            bool background = false;
             foreach (var a in args)
             {
                 if (a.Equals("--silent", StringComparison.OrdinalIgnoreCase) ||
                     a.Equals("/silent",  StringComparison.OrdinalIgnoreCase))
                     silent = true;
+                if (a.Equals("--background", StringComparison.OrdinalIgnoreCase) ||
+                    a.Equals("/background", StringComparison.OrdinalIgnoreCase))
+                    background = true;
             }
 
             bool createdNew;
@@ -44,13 +51,318 @@ namespace MouseJigglerApp
                 {
                     // Already running: hand the window over to the existing copy and bail.
                     // Launching a second instance would otherwise fail to grab the hotkey.
-                    if (!silent) PostMessage(HWND_BROADCAST, WM_SHOW_INSTANCE, IntPtr.Zero, IntPtr.Zero);
+                    if (!silent && !background) PostMessage(HWND_BROADCAST, WM_SHOW_INSTANCE, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
 
-                Application.Run(new MainForm(silent));
+                StreamDeckEnabled = true;
+                Application.Run(new MainForm(silent, background));
                 GC.KeepAlive(single);
             }
+        }
+    }
+
+    // Local, same-user/session IPC. The worker never calls a UI control directly;
+    // every state read/change is dispatched to the form's current UI handle.
+    internal sealed class StreamDeckServer : IDisposable
+    {
+        internal const int MaxRequestBytes = 256;
+        internal const int RequestTimeoutMilliseconds = 2000;
+        internal const int UiTimeoutMilliseconds = 2000;
+        internal const int WriteTimeoutMilliseconds = 2000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CancelIoEx(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeClientSessionId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint sessionId);
+
+        private readonly Control owner;
+        private readonly Func<string, string> handleCommand;
+        private readonly string pipeName;
+        private readonly int sessionId;
+        private readonly System.Security.Principal.SecurityIdentifier userSid;
+        private readonly object gate = new object();
+        private readonly System.Threading.ManualResetEvent stopped = new System.Threading.ManualResetEvent(false);
+        private readonly System.Threading.Thread worker;
+        private NamedPipeServerStream currentPipe;
+        private volatile bool stopping;
+
+        private sealed class UiRequest
+        {
+            internal readonly object Gate = new object();
+            internal readonly System.Threading.ManualResetEvent Done = new System.Threading.ManualResetEvent(false);
+            internal bool Cancelled;
+            internal string Response;
+        }
+
+        internal StreamDeckServer(Control owner, Func<string, string> handleCommand,
+            string pipeName, string descriptorPath)
+        {
+            this.owner = owner;
+            this.handleCommand = handleCommand;
+            this.pipeName = pipeName;
+            using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+                userSid = identity.User;
+            if (userSid == null) throw new InvalidOperationException("Current user identity is unavailable.");
+            int processId;
+            using (var process = System.Diagnostics.Process.GetCurrentProcess())
+            {
+                processId = process.Id;
+                sessionId = process.SessionId;
+            }
+            try
+            {
+                currentPipe = CreatePipe();
+                WriteDescriptor(descriptorPath, pipeName, processId);
+                worker = new System.Threading.Thread(Run);
+                worker.IsBackground = true;
+                worker.Name = "Mouse Jiggler Stream Deck";
+                worker.Start();
+            }
+            catch
+            {
+                if (currentPipe != null) currentPipe.Dispose();
+                stopped.Dispose();
+                throw;
+            }
+        }
+
+        private NamedPipeServerStream CreatePipe()
+        {
+            var security = new System.IO.Pipes.PipeSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.SetOwner(userSid);
+            security.AddAccessRule(new System.IO.Pipes.PipeAccessRule(userSid,
+                System.IO.Pipes.PipeAccessRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+            return new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous, MaxRequestBytes, 512, security);
+        }
+
+        private void Run()
+        {
+            try
+            {
+                while (!stopping)
+                {
+                    NamedPipeServerStream pipe = null;
+                    bool failed = false;
+                    try
+                    {
+                        lock (gate)
+                        {
+                            if (stopping) break;
+                            if (currentPipe == null) currentPipe = CreatePipe();
+                            pipe = currentPipe;
+                        }
+                        IAsyncResult connection = pipe.BeginWaitForConnection(null, null);
+                        using (connection.AsyncWaitHandle)
+                        {
+                            int ready = System.Threading.WaitHandle.WaitAny(new[] { connection.AsyncWaitHandle, stopped });
+                            if (ready != 0) CancelPending(pipe);
+                            pipe.EndWaitForConnection(connection);
+                            if (ready != 0 || stopping) continue;
+                        }
+                        uint clientSession;
+                        if (!GetNamedPipeClientSessionId(pipe.SafePipeHandle, out clientSession) || clientSession != (uint)sessionId)
+                        {
+                            WriteResponse(pipe, Error("Client session is not permitted."));
+                            continue;
+                        }
+                        HandleConnection(pipe);
+                    }
+                    catch (Exception) { failed = true; }
+                    finally
+                    {
+                        lock (gate)
+                            if (Object.ReferenceEquals(currentPipe, pipe)) currentPipe = null;
+                        if (pipe != null) pipe.Dispose();
+                    }
+                    // A denied/broken client cannot terminate the server. Avoid a
+                    // busy retry loop if the endpoint itself becomes unavailable.
+                    if (failed && !stopping) stopped.WaitOne(100);
+                }
+            }
+            finally { stopped.Dispose(); }
+        }
+
+        private void HandleConnection(NamedPipeServerStream pipe)
+        {
+            try
+            {
+                string command = ReadRequest(pipe);
+                string response = Dispatch(command);
+                if (!stopping) WriteResponse(pipe, response);
+            }
+            catch (TimeoutException) { TryWriteError(pipe, "Request timed out."); }
+            catch (InvalidDataException) { TryWriteError(pipe, "Request is too long or incomplete."); }
+            catch (DecoderFallbackException) { TryWriteError(pipe, "Request must be valid UTF-8."); }
+        }
+
+        private string ReadRequest(NamedPipeServerStream pipe)
+        {
+            var buffer = new byte[MaxRequestBytes];
+            int used = 0;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            while (used < buffer.Length)
+            {
+                int remaining = RequestTimeoutMilliseconds - (int)elapsed.ElapsedMilliseconds;
+                if (remaining <= 0) throw new TimeoutException();
+                IAsyncResult read = pipe.BeginRead(buffer, used, buffer.Length - used, null, null);
+                int count;
+                using (read.AsyncWaitHandle)
+                {
+                    int ready = System.Threading.WaitHandle.WaitAny(new[] { read.AsyncWaitHandle, stopped }, remaining);
+                    if (ready != 0)
+                    {
+                        CancelPending(pipe);
+                        try { pipe.EndRead(read); } catch (IOException) { } catch (ObjectDisposedException) { }
+                        throw new TimeoutException();
+                    }
+                    count = pipe.EndRead(read);
+                }
+                if (count == 0) throw new InvalidDataException();
+                int end = Array.IndexOf(buffer, (byte)'\n', used, count);
+                used += count;
+                if (end >= 0)
+                    return new UTF8Encoding(false, true).GetString(buffer, 0, end).Trim().ToLowerInvariant();
+            }
+            throw new InvalidDataException();
+        }
+
+        private string Dispatch(string command)
+        {
+            var request = new UiRequest();
+            try
+            {
+                try
+                {
+                    owner.BeginInvoke(new MethodInvoker(delegate
+                    {
+                        lock (request.Gate)
+                        {
+                            if (request.Cancelled) return;
+                            request.Response = stopping ? Error("App is shutting down.") : InvokeCommand(command);
+                            request.Done.Set();
+                        }
+                    }));
+                }
+                catch (InvalidOperationException) { return Error("App is temporarily unavailable."); }
+                int ready = System.Threading.WaitHandle.WaitAny(new[] { request.Done, stopped }, UiTimeoutMilliseconds);
+                lock (request.Gate)
+                {
+                    if (ready == 0) return request.Response;
+                    request.Cancelled = true;
+                    return Error(ready == 1 ? "App is shutting down." : "UI request timed out.");
+                }
+            }
+            finally
+            {
+                // A timed-out callback is cancelled before closing its event, so
+                // it cannot mutate state or touch a disposed wait handle later.
+                lock (request.Gate)
+                {
+                    request.Cancelled = true;
+                    request.Done.Dispose();
+                }
+            }
+        }
+
+        private string InvokeCommand(string command)
+        {
+            try { return handleCommand(command); }
+            catch (Exception) { return Error("Command could not be completed."); }
+        }
+
+        private void WriteResponse(NamedPipeServerStream pipe, string response)
+        {
+            byte[] bytes = new UTF8Encoding(false).GetBytes(response + "\n");
+            IAsyncResult write = pipe.BeginWrite(bytes, 0, bytes.Length, null, null);
+            using (write.AsyncWaitHandle)
+            {
+                int ready = System.Threading.WaitHandle.WaitAny(new[] { write.AsyncWaitHandle, stopped }, WriteTimeoutMilliseconds);
+                if (ready != 0)
+                {
+                    CancelPending(pipe);
+                    try { pipe.EndWrite(write); } catch (IOException) { } catch (ObjectDisposedException) { }
+                    throw new TimeoutException();
+                }
+                pipe.EndWrite(write);
+            }
+        }
+
+        private void TryWriteError(NamedPipeServerStream pipe, string message)
+        {
+            if (stopping) return;
+            try { WriteResponse(pipe, Error(message)); } catch (Exception) { }
+        }
+
+        private static void CancelPending(NamedPipeServerStream pipe)
+        {
+            try { CancelIoEx(pipe.SafePipeHandle, IntPtr.Zero); }
+            catch (ObjectDisposedException) { }
+        }
+
+        private static void WriteDescriptor(string path, string pipeName, int processId)
+        {
+            string directory = Path.GetDirectoryName(path);
+            Directory.CreateDirectory(directory);
+            string temporary = Path.Combine(directory, "streamdeck." + processId + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            string json = "{\"protocolVersion\":1,\"pipeName\":\"" + Escape(pipeName) +
+                "\",\"executablePath\":\"" + Escape(Application.ExecutablePath) + "\",\"processId\":" + processId + "}";
+            try
+            {
+                File.WriteAllText(temporary, json, new UTF8Encoding(false));
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        }
+
+        internal static string Error(string message)
+        {
+            return "{\"ok\":false,\"error\":\"" + Escape(message) + "\"}";
+        }
+
+        private static string Escape(string value)
+        {
+            var text = new StringBuilder();
+            foreach (char c in value)
+            {
+                switch (c)
+                {
+                    case '\\': text.Append("\\\\"); break;
+                    case '"': text.Append("\\\""); break;
+                    case '\b': text.Append("\\b"); break;
+                    case '\f': text.Append("\\f"); break;
+                    case '\n': text.Append("\\n"); break;
+                    case '\r': text.Append("\\r"); break;
+                    case '\t': text.Append("\\t"); break;
+                    default:
+                        if (c < 32) text.Append("\\u" + ((int)c).ToString("x4"));
+                        else text.Append(c);
+                        break;
+                }
+            }
+            return text.ToString();
+        }
+
+        public void Dispose()
+        {
+            NamedPipeServerStream pipe;
+            lock (gate)
+            {
+                if (stopping) return;
+                stopping = true;
+                stopped.Set();
+                pipe = currentPipe;
+            }
+            if (pipe != null)
+            {
+                CancelPending(pipe);
+                pipe.Dispose();
+            }
+            // Keep the descriptor as a launch hint. It is not a running-state
+            // claim: clients must probe the pipe, and a new process replaces it.
         }
     }
 
@@ -936,6 +1248,7 @@ namespace MouseJigglerApp
         private readonly ToggleSwitch idleCheck;
         private readonly ToggleSwitch awakeCheck;
         private readonly NotifyIcon tray;
+        private StreamDeckServer streamDeckServer;
         private Icon trayIconOn;
         private Icon trayIconOff;
         private bool themeReady;
@@ -995,12 +1308,14 @@ namespace MouseJigglerApp
             }
         }
 
-        public MainForm(bool silent)
+        public MainForm(bool silent) : this(silent, false) { }
+
+        public MainForm(bool silent, bool background)
         {
             Theme.Refresh();
             LoadSettings();
 
-            if (silent)
+            if (silent || background)
             {
                 startHidden = true;
             }
@@ -1233,6 +1548,50 @@ namespace MouseJigglerApp
             // Load waits until the first visible show. Start here so a silent
             // launch jiggles immediately and later showing it cannot retoggle.
             if (silent) Toggle();
+            if (Program.StreamDeckEnabled) StartStreamDeckServer();
+        }
+
+        private void StartStreamDeckServer()
+        {
+            try
+            {
+                streamDeckServer = new StreamDeckServer(this, HandleStreamDeckCommand,
+                    GetStreamDeckPipeName(), GetStreamDeckDescriptorPath());
+            }
+            catch (Exception)
+            {
+                // Integration is optional; a file/pipe permission failure must
+                // not stop ordinary tray, shortcut, or startup behavior.
+                streamDeckServer = null;
+            }
+        }
+
+        internal static string GetStreamDeckPipeName()
+        {
+            using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                return "MouseJiggler.StreamDeck." + identity.User.Value + "." + process.SessionId;
+        }
+
+        internal static string GetStreamDeckDescriptorPath()
+        {
+            return Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MouseJiggler"), "streamdeck.json");
+        }
+
+        internal string HandleStreamDeckCommand(string command)
+        {
+            if (IsDisposed || Disposing) return StreamDeckServer.Error("App is shutting down.");
+            switch (command)
+            {
+                case "status": break;
+                case "toggle": Toggle(); break;
+                case "on": if (!timer.Enabled) Toggle(); break;
+                case "off": if (timer.Enabled) Toggle(); break;
+                default: return StreamDeckServer.Error("Unknown command.");
+            }
+            using (var process = System.Diagnostics.Process.GetCurrentProcess())
+                return "{\"ok\":true,\"protocolVersion\":1,\"running\":true,\"active\":" +
+                    (timer.Enabled ? "true" : "false") + ",\"processId\":" + process.Id + "}";
         }
 
         private void SetOpaqueRegion()
@@ -1987,6 +2346,7 @@ namespace MouseJigglerApp
         {
             if (disposing)
             {
+                if (streamDeckServer != null) streamDeckServer.Dispose();
                 SetThreadExecutionState(ES_CONTINUOUS);
                 if (tray != null) tray.Visible = false;
                 if (tray != null)

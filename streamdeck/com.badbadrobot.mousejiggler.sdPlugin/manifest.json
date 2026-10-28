@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.badbadrobot.mousejiggler",
+  "Name": "Mouse Jiggler",
+  "Version": "1.0.1.0",
+  "Author": "Joshua Schaible",
+  "Description": "Toggle Mouse Jiggler and see its live on/off status.",
+  "URL": "https://github.com/joshuaschaible/MouseJiggler",
+  "Icon": "assets/plugin",
+  "Category": "Mouse Jiggler",
+  "CategoryIcon": "assets/category",
+  "CodePath": "plugin.js",
+  "Nodejs": { "Version": "20" },
+  "SDKVersion": 2,
+  "Software": { "MinimumVersion": "6.9" },
+  "OS": [{ "Platform": "windows", "MinimumVersion": "10" }],
+  "ApplicationsToMonitor": { "windows": ["MouseJiggler.exe"] },
+  "Actions": [{
+    "UUID": "com.badbadrobot.mousejiggler.toggle",
+    "Name": "Toggle Mouse Jiggler",
+    "Tooltip": "Turn Mouse Jiggler on or off. The icon follows its actual status.",
+    "Icon": "assets/category",
+    "Controllers": ["Keypad"],
+    "DisableAutomaticStates": true,
+    "UserTitleEnabled": false,
+    "SupportedInMultiActions": false,
+    "PropertyInspectorPath": "inspector/index.html",
+    "States": [
+      { "Image": "assets/power-off", "Title": "IDLE", "TitleAlignment": "bottom", "FontSize": 10, "TitleColor": "#B0B3C1" },
+      { "Image": "assets/power-on", "Title": "ACTIVE", "TitleAlignment": "bottom", "FontSize": 10, "TitleColor": "#00D4FF" }
+    ]
+  }]
+}

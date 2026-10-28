@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src ws://127.0.0.1:*">
+  <title>Mouse Jiggler</title>
+  <link rel="stylesheet" href="inspector.css">
+</head>
+<body>
+  <p id="status" role="status">Checking Mouse Jiggler…</p>
+  <p id="detail">The button shows the app’s live on/off status.</p>
+  <button id="test-button" type="button" disabled>Test button</button>
+  <label for="app-path">App location <span>(optional)</span></label>
+  <input id="app-path" type="text" placeholder="C:\…\MouseJiggler.exe" spellcheck="false" autocomplete="off">
+  <p class="hint">Leave blank to find the app automatically. If you move it, enter the full path to MouseJiggler.exe.</p>
+  <p class="hint">Press once to toggle. If the app is closed, the button opens it in the tray and turns jiggling on.</p>
+  <script src="inspector.js"></script>
+</body>
+</html>

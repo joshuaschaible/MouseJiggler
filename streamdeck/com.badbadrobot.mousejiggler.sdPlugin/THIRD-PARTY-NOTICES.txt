@@ -1,0 +1,7 @@
+ws 8.22.0 — MIT License
+https://github.com/websockets/ws
+https://registry.npmjs.org/ws/-/ws-8.22.0.tgz
+Upstream SHA512 integrity: Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==
+
+The unmodified package is bundled under vendor/ws. Its license is at vendor/ws/LICENSE.
+Optional native dependencies are not bundled; ws uses its supported JavaScript implementation.

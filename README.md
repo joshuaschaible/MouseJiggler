@@ -11,6 +11,7 @@ A tiny Windows 11 utility that nudges your mouse every N seconds so games and ap
 | `MouseJiggler.exe` | The compiled app (created after you run `build.bat`) |
 | `MouseJiggler_icon.png` | High-resolution source artwork for the app icon |
 | `make_icon.ps1` | Rebuilds the multi-resolution `.ico` and preview from the source artwork |
+| `streamdeck/` | Dedicated Stream Deck plugin, matching power icons, packaging scripts, and tests |
 
 ## Build
 
@@ -53,6 +54,14 @@ The app automatically follows **Settings → Personalization → Colors → Choo
 - **Window position** — where you leave the window is where it reopens. Placement is clamped to a monitor's usable area on startup and when the display arrangement changes, keeping the title bar reachable. Keyboard moves and recovery save the new position.
 
 This repository contains a Windows WinForms app. **Alt** is the Windows equivalent of the requested **Option** modifier (including Option on an Apple keyboard mapped to Alt by Windows); there is no macOS application in this project.
+
+## Stream Deck
+
+The dedicated **Mouse Jiggler → Toggle Mouse Jiggler** action turns jiggling on or off and displays the app's actual state. The power icon is gray for **IDLE**, violet/cyan for **ACTIVE**, and dashed for **OFFLINE**. Changes made through the app, tray, or keyboard shortcut appear on the key within about half a second.
+
+When the app is closed, pressing the key launches it hidden and turns jiggling on. It uses the same saved preferences as the normal app. The button's property inspector also includes a **Test button** control. See [the plugin instructions](streamdeck/README.md) for installation and packaging.
+
+The connection uses a local named pipe restricted to the current Windows user and session. It does not send keyboard shortcuts or require a network listener. The app records connection information and its executable path in `%LOCALAPPDATA%\MouseJiggler\streamdeck.json`; the plugin checks the live connection before showing a running state. `--background` starts hidden and idle for the plugin, while the existing `--silent` Windows-startup option starts hidden and active.
 
 ## How it works
 
